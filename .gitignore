@@ -1,0 +1,15 @@
+# Data files — download from Kaggle, do not commit
+*.csv
+data/
+
+# R history and environment
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+
+# Knitted output (optional — remove this line if you want to commit HTML)
+*.html
+
+# Mac system files
+.DS_Store

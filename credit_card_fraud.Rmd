@@ -1,0 +1,639 @@
+---
+title: "Credit Card Fraud Detection"
+author: "Suin Kim"
+output: html_document
+---
+
+# 1. Setup & Data Loading
+
+```{r setup, message=FALSE, warning=FALSE}
+# Load all required libraries upfront
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(knitr)
+library(stats)
+library(pROC)
+library(randomForest)
+library(ranger)
+library(caret)
+
+# Load dataset
+# Place card_transdata.csv in your working directory before running
+# Dataset: https://www.kaggle.com/datasets/dhanushnarayananr/credit-card-fraud
+df <- read_csv("card_transdata.csv", show_col_types = FALSE)
+
+cat("Dimensions:", dim(df), "\n")
+```
+
+---
+
+# 2. Exploratory Data Analysis
+
+## 2.1 Dataset Overview
+
+```{r eda-overview}
+# Column summary: data types, missing values, and averages
+summary_table <- df %>%
+  summarise(
+    Column_Name = names(.),
+    Data_Type = sapply(., class),
+    Missing_Values = sapply(., function(col) sum(is.na(col))),
+    Average = sapply(., function(col) if (is.numeric(col)) round(mean(col, na.rm = TRUE), 4) else NA)
+  ) %>%
+  as.data.frame()
+
+kable(summary_table, caption = "Column Summary: Data Type, Missing Values, and Averages")
+```
+
+```{r eda-summary}
+# Full statistical summary of all variables
+summary(df)
+```
+
+## 2.2 Class Distribution
+
+```{r eda-class-distribution}
+# The target variable (fraud) is heavily imbalanced at ~8.74% fraud rate.
+# This needs to be addressed before modeling to avoid biased predictions.
+fraud_counts <- table(df$fraud)
+
+barplot(fraud_counts,
+        main = "Fraud Count Distribution",
+        xlab = "Fraud Indicator",
+        ylab = "Number of Transactions",
+        col = c("green", "red"),
+        names.arg = c("No Fraud", "Fraud"))
+
+cat("Fraud rate:", round(mean(df$fraud) * 100, 2), "%\n")
+```
+
+## 2.3 Fraud Rate by Binary Variables
+
+```{r eda-fraud-rates}
+# Before modeling, we examine fraud rates across binary features.
+# This helps us understand which variables carry the most predictive signal.
+binary_vars <- c("repeat_retailer", "used_chip", "used_pin_number", "online_order")
+
+fraud_rate_table <- do.call(rbind, lapply(binary_vars, function(var) {
+  df %>%
+    group_by(Value = .data[[var]]) %>%
+    summarise(Fraud_Rate = round(mean(fraud) * 100, 2), .groups = "drop") %>%
+    mutate(Variable = var) %>%
+    select(Variable, Value, Fraud_Rate)
+}))
+
+kable(fraud_rate_table, caption = "Fraud Rate by Binary Variable")
+```
+
+Key findings:
+- **used_pin_number** is the strongest signal — fraud rate drops from 9.7% to just 0.27% when PIN is used
+- **online_order** nearly 10x the fraud rate compared to in-person transactions (12.7% vs 1.3%)
+- **repeat_retailer** shows almost no difference — motivating the interaction term tested later
+
+## 2.4 Continuous Variable Distributions
+
+```{r eda-histograms-raw}
+# Raw distributions — all three variables are heavily right-skewed
+# with extreme outliers, making log transformation necessary
+variables <- c("distance_from_home", "distance_from_last_transaction", "ratio_to_median_purchase_price")
+
+par(mfrow = c(1, 3), mar = c(5, 4, 4, 2))
+for (var in variables) {
+  hist(df[[var]],
+       main = paste("Raw:", var),
+       xlab = var,
+       col = "grey",
+       border = "black",
+       breaks = 25)
+}
+par(mfrow = c(1, 1))
+```
+
+```{r eda-histograms-transformed}
+# After log + sqrt transformation, distributions are more symmetric
+# and suitable for modeling
+par(mfrow = c(1, 3), mar = c(5, 4, 4, 2))
+for (var in variables) {
+  log_var <- (log(df[[var]] + 1))^(0.5)
+  hist(log_var,
+       main = paste("Transformed:", var),
+       xlab = var,
+       col = "grey",
+       border = "black",
+       breaks = 25)
+}
+par(mfrow = c(1, 1))
+```
+
+## 2.5 Fraud vs Non-Fraud: Continuous Variables
+
+```{r eda-boxplots}
+# Box plots comparing fraud vs non-fraud across continuous variables.
+# Clear separation confirms these variables are meaningful predictors.
+aliases <- c(
+  "distance_from_home" = "Distance from Home",
+  "distance_from_last_transaction" = "Distance from Last Transaction",
+  "ratio_to_median_purchase_price" = "Ratio to Median Purchase Price"
+)
+
+for (var in variables) {
+  p <- ggplot(df, aes(x = factor(fraud, levels = c(0, 1), labels = c("No", "Yes")),
+                      y = log(df[[var]] + 1)^(0.5), fill = factor(fraud))) +
+    geom_boxplot(outlier.shape = NA) +
+    labs(
+      title = paste("Fraud Status Comparison:", aliases[var]),
+      x = "Fraud Status",
+      y = paste("Transformed", aliases[var])
+    ) +
+    scale_fill_manual(values = c("green", "red"), name = "Fraud Status") +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5))
+  print(p)
+}
+```
+
+## 2.6 Binary Variables vs Fraud
+
+```{r eda-mosaic}
+# Mosaic plots show the proportion of fraud within each binary category.
+# Larger red areas indicate higher fraud concentration.
+aliases_binary <- c(
+  "repeat_retailer" = "Repeat Retailer",
+  "used_chip" = "Used Chip",
+  "used_pin_number" = "Used PIN",
+  "online_order" = "Online Order"
+)
+
+par(mfrow = c(2, 2), mar = c(5, 4, 4, 2))
+for (var in binary_vars) {
+  contingency_table <- table(df[[var]], df$fraud)
+  mosaicplot(
+    contingency_table,
+    main = paste("Mosaic:", aliases_binary[var], "vs Fraud"),
+    xlab = aliases_binary[var],
+    ylab = "Fraud",
+    color = TRUE
+  )
+}
+par(mfrow = c(1, 1))
+```
+
+## 2.7 Correlation Matrix
+
+```{r eda-correlation}
+# Check for multicollinearity between predictors.
+# High correlation between distance_from_home and repeat_retailer
+# motivates testing an interaction term in the logistic regression.
+numeric_cols <- sapply(df, is.numeric)
+cor_matrix <- cor(df[, numeric_cols], use = "complete.obs")
+print(round(cor_matrix, 3))
+```
+
+```{r eda-interaction-check}
+# Visualizing distance_from_home vs repeat_retailer to assess
+# whether an interaction term is warranted in the model
+p <- ggplot(df, aes(x = factor(repeat_retailer, levels = c(0, 1), labels = c("No", "Yes")),
+                    y = log(df$distance_from_home)^(0.5), fill = factor(repeat_retailer))) +
+  geom_boxplot(outlier.shape = NA) +
+  labs(
+    title = "Distance from Home vs Repeat Retailer",
+    x = "Repeat Retailer",
+    y = "Transformed Distance from Home"
+  ) +
+  scale_fill_manual(values = c("lightblue", "lightgreen"), name = "Repeat Retailer") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+print(p)
+```
+
+---
+
+# 3. Data Cleaning & Balancing
+
+```{r balancing}
+# The dataset is imbalanced (8.74% fraud). Training on imbalanced data causes
+# the model to predict the majority class almost exclusively.
+# We use bootstrapping (oversampling with replacement) to balance the classes.
+
+# Check original distribution
+cat("Original class distribution:\n")
+print(table(df$fraud))
+
+# Separate minority and majority classes
+minority <- df[df$fraud == 1, ]
+majority <- df[df$fraud == 0, ]
+
+# Bootstrap minority class to match majority size
+set.seed(123)
+minority_boot <- minority[sample(1:nrow(minority), size = nrow(majority), replace = TRUE), ]
+
+# Combine into balanced dataset
+balanced_df <- rbind(minority_boot, majority)
+
+cat("\nBalanced class distribution:\n")
+print(table(balanced_df$fraud))
+```
+
+```{r balancing-plot}
+# Confirm balance visually
+fraud_counts_balanced <- table(balanced_df$fraud)
+barplot(fraud_counts_balanced,
+        main = "Fraud Distribution After Bootstrapping",
+        xlab = "Fraud Indicator",
+        ylab = "Number of Transactions",
+        col = c("green", "red"),
+        names.arg = c("No Fraud", "Fraud"))
+```
+
+---
+
+# 4. Train / Test Split
+
+```{r train-test-split}
+# 70/30 train-test split on the balanced dataset
+# set.seed ensures reproducibility
+set.seed(123)
+train_ratio <- 0.7
+train_indices <- sample(1:nrow(balanced_df), size = floor(train_ratio * nrow(balanced_df)))
+
+train_data <- balanced_df[train_indices, ]
+test_data  <- balanced_df[-train_indices, ]
+
+cat("Training set size:", nrow(train_data), "\n")
+cat("Testing set size: ", nrow(test_data), "\n")
+cat("\nTraining class distribution:\n")
+print(table(train_data$fraud))
+cat("\nTesting class distribution:\n")
+print(table(test_data$fraud))
+```
+
+---
+
+# 5. Logistic Regression
+
+## 5.1 Feature Selection via Backward Elimination
+
+```{r logistic-backward}
+# Start with all predictors and use AIC-based backward elimination
+# to identify the most informative subset of features.
+full_model <- glm(fraud ~ ., data = train_data, family = binomial)
+best_model <- step(full_model, direction = "backward")
+summary(best_model)
+```
+
+## 5.2 Base Model (No Interaction)
+
+```{r logistic-base}
+# Fit logistic regression with all predictors selected by backward elimination.
+# This serves as the baseline before testing interaction terms.
+model <- glm(fraud ~ distance_from_home + distance_from_last_transaction +
+               ratio_to_median_purchase_price + repeat_retailer + used_chip +
+               used_pin_number + online_order,
+             data = train_data, family = binomial)
+
+summary(model)
+
+# Predict on training data
+predicted_probs <- predict(model, type = "response")
+predicted_classes <- ifelse(predicted_probs > 0.5, 1, 0)
+
+cat("\nTraining Confusion Matrix:\n")
+print(table(Predicted = predicted_classes, Actual = train_data$fraud))
+
+# Fitted probability plot — well-separated distributions indicate good model fit
+ggplot(train_data, aes(x = predicted_probs, fill = factor(fraud))) +
+  geom_density(alpha = 0.5) +
+  labs(title = "Fitted Probability Plot (Base Model)",
+       x = "Predicted Probability",
+       fill = "Fraud (0 = No, 1 = Yes)") +
+  theme_minimal()
+```
+
+## 5.3 Interaction Model
+
+```{r logistic-interaction}
+# EDA showed correlation between distance_from_home and repeat_retailer.
+# We test whether their interaction improves model fit.
+model2 <- glm(fraud ~ distance_from_home + distance_from_last_transaction +
+                ratio_to_median_purchase_price + repeat_retailer + used_chip +
+                used_pin_number + online_order + (distance_from_home * repeat_retailer),
+              data = train_data, family = binomial)
+
+summary(model2)
+
+predicted_probs_m2 <- predict(model2, type = "response")
+predicted_classes_m2 <- ifelse(predicted_probs_m2 > 0.5, 1, 0)
+
+cat("\nTraining Confusion Matrix (Interaction Model):\n")
+print(table(Predicted = predicted_classes_m2, Actual = train_data$fraud))
+
+ggplot(train_data, aes(x = predicted_probs_m2, fill = factor(fraud))) +
+  geom_density(alpha = 0.5) +
+  labs(title = "Fitted Probability Plot (Interaction Model)",
+       x = "Predicted Probability",
+       fill = "Fraud (0 = No, 1 = Yes)") +
+  theme_minimal()
+```
+
+## 5.4 Model Comparison: Likelihood Ratio Test
+
+```{r logistic-lrt}
+# Likelihood Ratio Test compares the two models.
+# A significant p-value means the interaction term adds meaningful explanatory power.
+model_no_interaction <- glm(fraud ~ distance_from_home + distance_from_last_transaction +
+                               ratio_to_median_purchase_price + repeat_retailer + used_chip +
+                               used_pin_number + online_order,
+                             family = "binomial", data = balanced_df)
+
+model_interaction <- glm(fraud ~ distance_from_home + distance_from_last_transaction +
+                            ratio_to_median_purchase_price + repeat_retailer + used_chip +
+                            used_pin_number + online_order + (distance_from_home * repeat_retailer),
+                          family = "binomial", data = balanced_df)
+
+anova(model_no_interaction, model_interaction, test = "LRT")
+```
+
+## 5.5 Test Set Evaluation
+
+```{r logistic-test-eval}
+# Evaluate the base model on held-out test data.
+# Precision and recall are more informative than accuracy for imbalanced fraud data.
+test_probs <- predict(model, newdata = test_data, type = "response")
+test_preds <- ifelse(test_probs > 0.5, 1, 0)
+
+conf_matrix <- table(Predicted = test_preds, Actual = test_data$fraud)
+print(conf_matrix)
+
+accuracy  <- sum(diag(conf_matrix)) / sum(conf_matrix)
+precision <- conf_matrix[2, 2] / sum(conf_matrix[2, ])
+recall    <- conf_matrix[2, 2] / sum(conf_matrix[, 2])
+f1_score  <- 2 * (precision * recall) / (precision + recall)
+
+cat("Accuracy: ", round(accuracy, 4), "\n")
+cat("Precision:", round(precision, 4), "\n")
+cat("Recall:   ", round(recall, 4), "\n")
+cat("F1-Score: ", round(f1_score, 4), "\n")
+```
+
+```{r logistic-roc}
+# ROC curve and AUC measure discrimination ability across all thresholds.
+# AUC of 1.0 = perfect, 0.5 = random chance.
+roc_obj <- roc(test_data$fraud, test_preds)
+auc_val <- auc(roc_obj)
+plot(roc_obj, main = paste("ROC Curve (AUC =", round(auc_val, 3), ")"))
+cat("AUC:", round(auc_val, 3), "\n")
+```
+
+---
+
+# 6. Random Forest
+
+```{r rf-model}
+# Random Forest is an ensemble method that builds many decision trees and
+# aggregates their predictions. It handles non-linear relationships and
+# interactions naturally, making it well-suited for fraud detection.
+
+# Convert fraud to factor for classification
+df$fraud <- as.factor(df$fraud)
+
+# Train/test split on original (unbalanced) df for RF
+# RF handles class imbalance better than logistic regression
+set.seed(123)
+train_index_rf <- createDataPartition(df$fraud, p = 0.7, list = FALSE)
+train_data_rf  <- df[train_index_rf, ]
+test_data_rf   <- df[-train_index_rf, ]
+
+# Fit RF with ranger (memory-efficient implementation)
+# num.trees=200 balances accuracy and compute time
+# mtry=3 = number of variables tried at each split
+rf_model <- ranger(fraud ~ ., data = train_data_rf,
+                   num.trees = 200, mtry = 3, importance = "impurity")
+
+print(rf_model)
+
+# Predict on test data
+rf_predictions      <- predict(rf_model, data = test_data_rf, type = "response")
+rf_predicted_classes <- rf_predictions$predictions
+
+# Confusion matrix
+confusionMatrix(as.factor(rf_predicted_classes), test_data_rf$fraud)
+# Note: Near-perfect accuracy is expected here but warrants cross-validation
+# to rule out overfitting
+```
+
+```{r rf-importance}
+# Feature importance shows which variables drive predictions the most.
+# Higher impurity reduction = more important variable.
+importance <- rf_model$variable.importance
+sorted_importance <- sort(importance, decreasing = TRUE)
+
+par(mar = c(5, 11, 8, 2))
+barplot(
+  sorted_importance,
+  main = "Random Forest Feature Importance",
+  horiz = TRUE,
+  las = 1,
+  col = "steelblue",
+  xlab = "Importance Score",
+  names.arg = names(sorted_importance),
+  cex.names = 0.8
+)
+par(mar = c(5, 4, 4, 2))
+```
+
+## 6.1 Cross-Validation
+
+```{r rf-cv}
+# The initial RF hit near-100% accuracy — a red flag for overfitting.
+# Cross-validation confirms whether this holds across different data splits.
+cv_control <- trainControl(
+  method = "cv",
+  number = 3,
+  verboseIter = TRUE,
+  savePredictions = "final"
+)
+
+rf_cv_model <- train(
+  fraud ~ ., data = train_data_rf,
+  method = "ranger",
+  trControl = cv_control,
+  tuneGrid = expand.grid(
+    mtry = c(2, 3),
+    splitrule = "gini",
+    min.node.size = c(5)
+  ),
+  metric = "Accuracy",
+  num.trees = 200
+)
+
+print(rf_cv_model)
+
+# Predict on test data using CV model
+cv_test_preds <- predict(rf_cv_model, newdata = test_data_rf)
+cv_conf_matrix <- confusionMatrix(cv_test_preds, test_data_rf$fraud)
+print(cv_conf_matrix)
+```
+
+---
+
+# 7. Example Predictions
+
+```{r example-transactions}
+# To demonstrate real-world utility, we test three transactions:
+# a clearly safe one, a clearly fraudulent one, and a borderline case.
+# This shows how the model behaves across different risk profiles.
+
+example_transactions <- data.frame(
+  scenario = c("Low Risk", "High Risk", "Borderline"),
+  distance_from_home = c(2, 150, 25),
+  distance_from_last_transaction = c(1, 200, 13),
+  ratio_to_median_purchase_price = c(0.8, 8.5, 1.5),
+  repeat_retailer = c(1, 0, 1),
+  used_chip = c(1, 0, 1),
+  used_pin_number = c(1, 0, 0),
+  online_order = c(0, 1, 1)
+)
+
+# Predict fraud probability for each scenario using the interaction model
+input_data <- example_transactions[, -1]  # drop scenario label column
+predicted_probs <- predict(model2, newdata = input_data, type = "response")
+predicted_classes <- ifelse(predicted_probs > 0.5, "Fraud", "Not Fraud")
+
+results <- example_transactions %>%
+  mutate(
+    Fraud_Probability = round(predicted_probs, 4),
+    Prediction = predicted_classes
+  )
+
+kable(results, caption = "Example Transaction Predictions")
+```
+
+**Interpretation:**
+- **Low Risk**: Short distance from home, PIN used, chip used, in-person — model assigns near-zero fraud probability. Matches EDA finding that PIN usage drops fraud rate to 0.27%.
+- **High Risk**: Far from home, far from last transaction, high purchase ratio, online, no chip, no PIN — model flags as high fraud probability. Every major risk factor is present.
+- **Borderline**: Mixed signals — repeat retailer and chip used, but online order with no PIN and moderate distance. Model uses the interaction between `distance_from_home` and `repeat_retailer` to moderate the risk.
+
+---
+
+## 7.1 Threshold Analysis
+
+```{r threshold-analysis}
+# The default 0.5 threshold is not always optimal for fraud detection.
+# Lowering the threshold catches more fraud (higher recall) but increases
+# false positives — legitimate transactions flagged as fraud.
+# This is a business decision: what is the cost of a missed fraud vs
+# the cost of falsely declining a legitimate transaction?
+
+thresholds <- c(0.3, 0.4, 0.5, 0.6, 0.7)
+
+threshold_results <- do.call(rbind, lapply(thresholds, function(t) {
+  preds <- ifelse(test_probs > t, 1, 0)
+  cm <- table(Predicted = preds, Actual = test_data$fraud)
+  
+  # Handle edge cases where a class may be missing
+  tp <- ifelse(!is.na(cm["1","1"]), cm["1","1"], 0)
+  fp <- ifelse(!is.na(cm["1","0"]), cm["1","0"], 0)
+  tn <- ifelse(!is.na(cm["0","0"]), cm["0","0"], 0)
+  fn <- ifelse(!is.na(cm["0","1"]), cm["0","1"], 0)
+  
+  precision <- ifelse((tp + fp) > 0, tp / (tp + fp), 0)
+  recall    <- ifelse((tp + fn) > 0, tp / (tp + fn), 0)
+  f1        <- ifelse((precision + recall) > 0,
+                      2 * precision * recall / (precision + recall), 0)
+  accuracy  <- (tp + tn) / (tp + fp + tn + fn)
+  
+  data.frame(
+    Threshold = t,
+    Accuracy  = round(accuracy, 4),
+    Precision = round(precision, 4),
+    Recall    = round(recall, 4),
+    F1_Score  = round(f1, 4)
+  )
+}))
+
+kable(threshold_results, caption = "Model Performance Across Decision Thresholds")
+```
+
+**Business interpretation:**
+- A **lower threshold (0.3)** prioritizes catching fraud — useful when the cost of a missed fraud is high (e.g. large transactions)
+- A **higher threshold (0.7)** reduces false positives — useful when customer experience matters more and false declines are costly
+- For most fraud systems, **0.4–0.5** balances both concerns well
+
+---
+
+# 8. Model Comparison & Conclusion
+
+## 8.1 Model Comparison
+
+```{r model-comparison}
+# Consolidate all model metrics in one place for direct comparison.
+# This gives a clear view of the tradeoffs between interpretability and performance.
+
+# Logistic Regression metrics (from test set)
+lr_preds <- ifelse(test_probs > 0.5, 1, 0)
+lr_cm    <- table(Predicted = lr_preds, Actual = test_data$fraud)
+lr_acc   <- sum(diag(lr_cm)) / sum(lr_cm)
+lr_prec  <- lr_cm["1","1"] / sum(lr_cm["1",])
+lr_rec   <- lr_cm["1","1"] / sum(lr_cm[,"1"])
+lr_f1    <- 2 * lr_prec * lr_rec / (lr_prec + lr_rec)
+lr_auc   <- as.numeric(auc(roc(test_data$fraud, test_probs)))
+
+# Random Forest metrics (from CV model test set)
+rf_cm_obj <- confusionMatrix(cv_test_preds, test_data_rf$fraud)
+rf_acc    <- rf_cm_obj$overall["Accuracy"]
+rf_prec   <- rf_cm_obj$byClass["Precision"]
+rf_rec    <- rf_cm_obj$byClass["Recall"]
+rf_f1     <- rf_cm_obj$byClass["F1"]
+
+comparison_table <- data.frame(
+  Model = c("Logistic Regression", "Random Forest (CV)"),
+  Accuracy  = round(c(lr_acc, rf_acc), 4),
+  Precision = round(c(lr_prec, rf_prec), 4),
+  Recall    = round(c(lr_rec, rf_rec), 4),
+  F1_Score  = round(c(lr_f1, rf_f1), 4),
+  AUC       = c(round(lr_auc, 4), "N/A"),
+  Interpretable = c("Yes", "No")
+)
+
+kable(comparison_table, caption = "Model Comparison: Logistic Regression vs Random Forest")
+```
+
+## 8.2 Recommendation
+
+```{r recommendation, echo=FALSE}
+cat("
+RECOMMENDATION
+==============
+Both models perform well, but serve different purposes:
+
+Logistic Regression:
+- Fully interpretable — coefficients directly explain why a transaction is flagged
+- Suitable for regulated environments where explainability is required
+- AUC confirms strong discrimination ability
+- Recommended for: production fraud flagging with human review
+
+Random Forest:
+- Higher raw accuracy, confirmed stable via 3-fold cross-validation
+- Captures non-linear patterns and interactions automatically
+- Less interpretable — harder to explain to stakeholders why a transaction was flagged
+- Recommended for: automated batch scoring where throughput matters more than explainability
+
+Final recommendation: deploy logistic regression as the primary model for
+explainability, with RF as a secondary validation layer for high-value transactions.
+")
+```
+
+## 8.3 Limitations & Next Steps
+
+**Current limitations:**
+- Dataset is synthetic — real-world fraud patterns are more complex and evolving
+- Bootstrapping is a simple balancing approach; SMOTE may produce better minority class representation
+- Models are static — fraud patterns shift over time, requiring periodic retraining
+
+**What I would do next:**
+1. **SMOTE** instead of bootstrapping for more realistic minority class augmentation
+2. **XGBoost** — often outperforms RF on tabular fraud data with less tuning
+3. **Real-time scoring pipeline** — wrap the model in a REST API (Plumber in R or FastAPI in Python) for live transaction scoring
+4. **Drift monitoring** — track model performance over time as fraud patterns evolve
+5. **Cost-sensitive learning** — assign different misclassification costs to false negatives vs false positives based on transaction value
