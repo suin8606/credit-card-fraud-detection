@@ -1,5 +1,7 @@
 # Credit Card Fraud Detection
 
+[![Live Report](https://img.shields.io/badge/Live%20Report-View%20Here-brightgreen?style=for-the-badge)](https://suin8606.github.io/credit-card-fraud-detection/credit_card_fraud.html)
+
 ![R](https://img.shields.io/badge/R-276DC3?style=for-the-badge&logo=r&logoColor=white)
 ![RMarkdown](https://img.shields.io/badge/RMarkdown-276DC3?style=for-the-badge&logo=r&logoColor=white)
 ![Tidyverse](https://img.shields.io/badge/Tidyverse-1A162D?style=for-the-badge&logo=r&logoColor=white)
